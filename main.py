@@ -1,7 +1,8 @@
 import os
 import json
 import time
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List, Optional, Literal
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header, Depends
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -29,6 +30,17 @@ class OrderCreate(BaseModel):
 
 class AdminLogin(BaseModel):
     key: str
+
+
+class ProductUpdate(BaseModel):
+    title: Optional[str] = None
+    category: Optional[str] = None
+    price: Optional[float] = None
+    moq: Optional[int] = None
+
+
+class OrderStatusUpdate(BaseModel):
+    status: Literal["pending", "processing", "completed"]
 
 
 def verify_admin(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")):
@@ -96,8 +108,957 @@ def get_orders(admin: bool = Depends(verify_admin)):
 def create_order(order: OrderCreate):
     if not supabase:
         raise HTTPException(status_code=500, detail="Database error")
-    res = supabase.table("orders").insert(order.model_dump()).execute()
+    order_data = order.model_dump()
+    order_data["status"] = "pending"
+    res = supabase.table("orders").insert(order_data).execute()
     return {"status": "success", "data": res.data}
+
+
+@app.patch("/api/orders/{order_id}/status")
+def update_order_status(order_id: int, payload: OrderStatusUpdate, admin: bool = Depends(verify_admin)):
+    """
+    تحديث حالة الطلب: pending (جديد) -> processing (قيد المعالجة) -> completed (مكتمل).
+    عند وضع الحالة "مكتمل" يُسجَّل تاريخ ووقت الإكمال تلقائياً.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    update_data = {"status": payload.status}
+    if payload.status == "completed":
+        update_data["completed_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        update_data["completed_at"] = None
+
+    res = supabase.table("orders").update(update_data).eq("id", order_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="الطلب غير موجود")
+    return {"status": "success", "data": res.data}
+
+
+@app.post("/api/products/upload")
+async def create_product_with_media(
+    title: str = Form(...),
+    category: str = Form(...),
+    price: float = Form(...),
+    moq: int = Form(...),
+    files: List[UploadFile] = File(...),
+    admin: bool = Depends(verify_admin)
+):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    media_urls = []
+    for file in files:
+        contents = await file.read()
+        file_ext = file.filename.split(".")[-1]
+        unique_name = f"{int(time.time()*1000)}_{file.filename}"
+        mime_type = file.content_type or "image/jpeg"
+
+        # رفع الملف لـ Supabase Storage
+        supabase.storage.from_("media").upload(
+            path=unique_name,
+            file=contents,
+            file_options={"content-type": mime_type}
+        )
+
+        # استخراج الرابط المباشر
+        public_url = supabase.storage.from_("media").get_public_url(unique_name)
+        is_video = "video" in mime_type.lower()
+        media_urls.append({"url": public_url, "type": "video" if is_video else "image"})
+
+    # إدخال البضاعة
+    prod_data = {
+        "title": title,
+        "category": category,
+        "price": price,
+        "moq": moq,
+        "image_url": media_urls[0]["url"] if media_urls else "",
+        "media": media_urls
+    }
+    res = supabase.table("products").insert(prod_data).execute()
+    return {"status": "success", "data": res.data}
+
+
+@app.put("/api/products/{product_id}")
+def update_product(product_id: int, payload: ProductUpdate, admin: bool = Depends(verify_admin)):
+    """
+    تعديل بيانات بضاعة موجودة (الاسم، التصنيف، السعر، الحد الأدنى للطلب).
+    لا يتعامل هذا المسار مع الصور/الفيديوهات - تعديل الوسائط يتم بحذف
+    البضاعة وإعادة رفعها من جديد في هذه النسخة.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="لا توجد بيانات لتحديثها")
+
+    res = supabase.table("products").update(update_data).eq("id", product_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="البضاعة غير موجودة")
+    return {"status": "success", "data": res.data}
+
+
+@app.delete("/api/products/{product_id}")
+def delete_product(product_id: int, admin: bool = Depends(verify_admin)):
+    """
+    حذف بضاعة نهائياً من قاعدة البيانات، مع محاولة حذف ملفاتها
+    (صور/فيديوهات) من Supabase Storage تلقائياً لتوفير المساحة.
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    existing = supabase.table("products").select("media").eq("id", product_id).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="البضاعة غير موجودة")
+
+    media_items = existing.data[0].get("media") or []
+    file_paths = []
+    for m in media_items:
+        url = m.get("url", "")
+        if url:
+            file_paths.append(url.split("/")[-1])
+
+    if file_paths:
+        try:
+            supabase.storage.from_("media").remove(file_paths)
+        except Exception:
+            # لا نمنع حذف السجل من قاعدة البيانات حتى لو فشل حذف الملفات من التخزين
+            pass
+
+    supabase.table("products").delete().eq("id", product_id).execute()
+    return {"status": "success"}
+
+
+@app.delete("/api/orders/{order_id}")
+def delete_order(order_id: int, admin: bool = Depends(verify_admin)):
+    """حذف طلب تسعيرة بعد معالجته من قبل مكتب الصين."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    supabase.table("orders").delete().eq("id", order_id).execute()
+    return {"status": "success"}
+
+
+@app.get("/", response_class=HTMLResponse)
+def serve_home():
+    return """
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>مكتب عبدالله حريري للتوريد والشحن الدولي</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Tajawal', sans-serif; }
+        #uploadProgressBar { transition: width 0.15s ease; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+
+    <!-- شريط علوي -->
+    <header class="bg-slate-900 text-white p-4 shadow-md sticky top-0 z-30 flex justify-between items-center">
+        <div>
+            <h1 class="text-base font-bold text-amber-400">عبدالله حريري للتوريد والشحن الدولي من الصين</h1>
+            <p class="text-xs text-slate-400">كافة خدمات الشراء والفحص والشحن من كوانزو وإيوو</p>
+        </div>
+        <div id="headerAdminArea" class="flex gap-2 items-center"></div>
+    </header>
+
+    <!-- المعرض -->
+    <main class="max-w-4xl mx-auto p-4 pb-20">
+        <h2 class="text-base font-bold text-gray-800 mb-3">أحدث العروض والبضائع المتوفرة:</h2>
+        <div id="products-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="col-span-full text-center py-10 text-gray-500">جاري تحميل البضائع...</div>
+        </div>
+
+        <!-- زر تحميل المزيد + نقطة مراقبة التمرير اللانهائي -->
+        <div class="text-center mt-5">
+            <button id="loadMoreBtn" onclick="loadMoreProducts()" class="hidden bg-white border border-gray-300 text-gray-700 text-sm px-5 py-2.5 rounded-lg font-bold shadow-sm hover:bg-gray-50">
+                تحميل المزيد من البضائع
+            </button>
+            <p id="noMoreText" class="hidden text-xs text-gray-400 py-2">لا توجد بضائع إضافية</p>
+        </div>
+        <div id="scrollSentinel" class="h-2"></div>
+    </main>
+
+    <!-- زر دخول خفي في أسفل الصفحة يفتح نافذة تسجيل دخول المدير -->
+    <div class="fixed bottom-3 left-3 z-20">
+        <button onclick="openAdminLogin()" id="lockBtn" class="bg-slate-800/70 hover:bg-slate-800 text-white text-xs w-8 h-8 rounded-full flex items-center justify-center shadow-lg">
+            🔒
+        </button>
+    </div>
+
+    <!-- نافذة تسجيل دخول المدير -->
+    <div id="adminLoginModal" class="fixed inset-0 bg-black/60 hidden z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl p-5 w-full max-w-xs shadow-2xl">
+            <h3 class="text-base font-bold text-gray-900 mb-1">دخول لوحة التحكم</h3>
+            <p class="text-xs text-gray-500 mb-3">هذه الصفحة مخصصة لمكتب الصين فقط</p>
+            <form onsubmit="handleAdminLogin(event)" class="space-y-3">
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 mb-1">كلمة مرور الإدارة</label>
+                    <input type="password" id="adminKeyInput" required autocomplete="current-password" class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <p id="adminLoginError" class="hidden text-xs text-red-600"></p>
+                <div class="flex gap-2 pt-1">
+                    <button type="submit" id="adminLoginBtn" class="flex-1 bg-slate-900 text-white py-2 rounded-lg font-bold text-sm">دخول</button>
+                    <button type="button" onclick="closeAdminLogin()" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-lg text-sm">إلغاء</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- نافذة رفع بضاعة جديدة مع صور وفيديوهات -->
+    <div id="adminUploadModal" class="fixed inset-0 bg-black/60 hidden z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl p-5 w-full max-w-md shadow-2xl max-h-[90vh] overflow-y-auto">
+            <h3 class="text-base font-bold text-gray-900 mb-3">مكتب الصين: رفع بضاعة جديدة</h3>
+            <form onsubmit="handleUpload(event)" class="space-y-3">
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 mb-1">اسم البضاعة</label>
+                    <input type="text" id="pTitle" required class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 mb-1">التصنيف</label>
+                        <input type="text" id="pCat" required placeholder="أقمشة، إلكترونيات" class="w-full border rounded-lg p-2 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 mb-1">السعر التقريبي ($)</label>
+                        <input type="number" step="0.01" id="pPrice" required class="w-full border rounded-lg p-2 text-sm">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 mb-1">أقل كمية للطلب (MOQ)</label>
+                    <input type="number" id="pMoq" required class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 mb-1">حدد صور وفيديوهات البضاعة من الهاتف (متعدد)</label>
+                    <input type="file" id="pFiles" multiple accept="image/*,video/*" required class="w-full border rounded-lg p-1.5 text-xs">
+                </div>
+
+                <!-- شريط تقدم الرفع الحقيقي -->
+                <div id="uploadProgressWrap" class="hidden space-y-1">
+                    <div class="flex justify-between text-xs text-gray-600">
+                        <span id="uploadProgressLabel">جاري رفع الملفات...</span>
+                        <span id="uploadProgressPercent">0%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 rounded-full h-2.5 overflow-hidden">
+                        <div id="uploadProgressBar" class="bg-amber-600 h-2.5 rounded-full" style="width:0%"></div>
+                    </div>
+                    <p class="text-[11px] text-red-500">لا تغلق الصفحة أو تنتقل عنها أثناء الرفع</p>
+                </div>
+
+                <div class="flex gap-2 pt-2">
+                    <button type="submit" id="uploadBtn" class="flex-1 bg-amber-600 text-white py-2 rounded-lg font-bold text-sm">رفع وحفظ الآن</button>
+                    <button type="button" onclick="closeAdminUpload()" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-lg text-sm">إلغاء</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- نافذة تعديل بضاعة موجودة -->
+    <div id="editProductModal" class="fixed inset-0 bg-black/60 hidden z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl p-5 w-full max-w-md shadow-2xl">
+            <h3 class="text-base font-bold text-gray-900 mb-3">تعديل بيانات البضاعة</h3>
+            <form onsubmit="handleEditProduct(event)" class="space-y-3">
+                <input type="hidden" id="editProductId">
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 mb-1">اسم البضاعة</label>
+                    <input type="text" id="ePTitle" required class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 mb-1">التصنيف</label>
+                        <input type="text" id="ePCat" required class="w-full border rounded-lg p-2 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-700 mb-1">السعر التقريبي ($)</label>
+                        <input type="number" step="0.01" id="ePPrice" required class="w-full border rounded-lg p-2 text-sm">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-700 mb-1">أقل كمية للطلب (MOQ)</label>
+                    <input type="number" id="ePMoq" required class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <p class="text-[11px] text-gray-400">لتغيير الصور أو الفيديوهات: احذف هذه البضاعة وارفعها من جديد.</p>
+                <p id="editProductError" class="hidden text-xs text-red-600"></p>
+                <div class="flex gap-2 pt-2">
+                    <button type="submit" id="editProductBtn" class="flex-1 bg-blue-600 text-white py-2 rounded-lg font-bold text-sm">حفظ التعديلات</button>
+                    <button type="button" onclick="closeEditProduct()" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-lg text-sm">إلغاء</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- نافذة لائحة الطلبات المستلمة -->
+    <div id="ordersModal" class="fixed inset-0 bg-black/60 hidden z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl p-5 w-full max-w-lg shadow-2xl max-h-[90vh] flex flex-col">
+            <div class="flex justify-between items-center mb-3">
+                <h3 class="text-base font-bold text-gray-900">الطلبات المستلمة</h3>
+                <button onclick="closeOrdersList()" class="text-gray-500 font-bold">✕</button>
+            </div>
+            <div id="ordersListContent" class="space-y-3 overflow-y-auto flex-1 pr-1">
+                جاري التحميل...
+            </div>
+        </div>
+    </div>
+
+    <!-- نافذة إرسال طلب عرض سعر الشحن -->
+    <div id="orderModal" class="fixed inset-0 bg-black/60 hidden z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl p-5 w-full max-w-md shadow-2xl">
+            <h3 class="text-base font-bold text-gray-900 mb-1">طلب تسعيرة شحن وتوريد</h3>
+            <p id="modalProductTitle" class="text-xs text-blue-600 font-bold mb-3"></p>
+            <form onsubmit="submitOrder(event)" class="space-y-2.5">
+                <input type="hidden" id="orderProductId">
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">اسم العميل / الشركة</label>
+                    <input type="text" id="custName" required class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">رقم الهاتف أو الواتساب</label>
+                    <input type="tel" id="custPhone" required class="w-full border rounded-lg p-2 text-sm text-left" placeholder="+963 / +971">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">دولة ومدينة الوصول</label>
+                    <input type="text" id="custDest" required class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">الكمية المطلوبة</label>
+                    <input type="number" id="custQty" required min="1" class="w-full border rounded-lg p-2 text-sm">
+                </div>
+                <div class="flex gap-2 pt-2">
+                    <button type="submit" class="flex-1 bg-emerald-600 text-white py-2 rounded-lg font-bold text-sm">إرسال الطلب</button>
+                    <button type="button" onclick="closeOrderModal()" class="bg-gray-200 text-gray-700 px-4 py-2 rounded-lg text-sm">إلغاء</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- نافذة معرض الصور والفيديوهات بالحجم الكامل مع التكبير -->
+    <div id="lightboxModal" class="fixed inset-0 bg-black/95 hidden z-[60] flex flex-col select-none">
+        <div class="flex justify-between items-center p-3 text-white text-sm shrink-0">
+            <span id="lightboxCounter" class="font-bold"></span>
+            <div class="flex gap-2">
+                <button onclick="lightboxZoomOut()" class="w-9 h-9 bg-white/10 rounded-full text-lg">➖</button>
+                <button onclick="lightboxZoomIn()" class="w-9 h-9 bg-white/10 rounded-full text-lg">➕</button>
+                <button onclick="closeLightbox()" class="w-9 h-9 bg-white/10 rounded-full text-lg">✕</button>
+            </div>
+        </div>
+        <div id="lightboxContent"
+             class="flex-1 relative overflow-auto flex items-center justify-center"
+             ontouchstart="lightboxTouchStart(event)"
+             ontouchend="lightboxTouchEnd(event)">
+        </div>
+        <button id="lightboxPrev" onclick="lightboxPrev()" class="absolute left-2 top-1/2 -translate-y-1/2 w-11 h-11 bg-white/10 text-white rounded-full text-2xl">‹</button>
+        <button id="lightboxNext" onclick="lightboxNext()" class="absolute right-2 top-1/2 -translate-y-1/2 w-11 h-11 bg-white/10 text-white rounded-full text-2xl">›</button>
+    </div>
+
+    <script>
+        // ============ إعدادات التقسيم (Pagination) ============
+        const PAGE_SIZE = 8;
+        let currentOffset = 0;
+        let isLoadingProducts = false;
+        let reachedEnd = false;
+
+        // ============ حالة تسجيل دخول المدير ============
+        let isAdmin = false;
+
+        function getAdminKey() {
+            return localStorage.getItem('adminKey') || '';
+        }
+
+        function renderAdminHeader() {
+            const area = document.getElementById('headerAdminArea');
+            const lockBtn = document.getElementById('lockBtn');
+            if (isAdmin) {
+                area.innerHTML = `
+                    <button onclick="openAdminUpload()" class="bg-amber-600 text-white text-xs px-2.5 py-2 rounded-lg font-bold">
+                        + رفع بضاعة
+                    </button>
+                    <button onclick="openOrdersList()" class="bg-slate-700 text-white text-xs px-2.5 py-2 rounded-lg font-bold">
+                        📋 الطلبات
+                    </button>
+                    <button onclick="adminLogout()" class="bg-slate-600 text-white text-xs px-2.5 py-2 rounded-lg font-bold">
+                        خروج
+                    </button>
+                `;
+                lockBtn.classList.add('hidden');
+            } else {
+                area.innerHTML = '';
+                lockBtn.classList.remove('hidden');
+            }
+        }
+
+        async function verifyAdminSession() {
+            const key = getAdminKey();
+            if (!key) { isAdmin = false; renderAdminHeader(); return; }
+            try {
+                const res = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({key})
+                });
+                if (res.ok) {
+                    isAdmin = true;
+                } else {
+                    localStorage.removeItem('adminKey');
+                    isAdmin = false;
+                }
+            } catch (e) {
+                isAdmin = false;
+            }
+            renderAdminHeader();
+        }
+
+        function openAdminLogin() {
+            document.getElementById('adminLoginError').classList.add('hidden');
+            document.getElementById('adminKeyInput').value = '';
+            document.getElementById('adminLoginModal').classList.remove('hidden');
+        }
+        function closeAdminLogin() {
+            document.getElementById('adminLoginModal').classList.add('hidden');
+        }
+
+        async function handleAdminLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('adminLoginBtn');
+            const errEl = document.getElementById('adminLoginError');
+            errEl.classList.add('hidden');
+            const key = document.getElementById('adminKeyInput').value;
+            btn.disabled = true;
+            btn.innerText = 'جاري التحقق...';
+            try {
+                const res = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({key})
+                });
+                if (res.ok) {
+                    localStorage.setItem('adminKey', key);
+                    isAdmin = true;
+                    renderAdminHeader();
+                    closeAdminLogin();
+                    fetchProducts();
+                } else {
+                    errEl.innerText = 'كلمة المرور غير صحيحة';
+                    errEl.classList.remove('hidden');
+                }
+            } catch (e2) {
+                errEl.innerText = 'تعذر الاتصال بالخادم';
+                errEl.classList.remove('hidden');
+            }
+            btn.disabled = false;
+            btn.innerText = 'دخول';
+        }
+
+        function adminLogout() {
+            localStorage.removeItem('adminKey');
+            isAdmin = false;
+            renderAdminHeader();
+            fetchProducts();
+        }
+
+        // إذا رفض الخادم طلباً بسبب صلاحية منتهية، أعد فتح نافذة الدخول
+        function handleAuthFailure() {
+            localStorage.removeItem('adminKey');
+            isAdmin = false;
+            renderAdminHeader();
+            fetchProducts();
+            alert('انتهت صلاحية جلسة الإدارة، يرجى تسجيل الدخول من جديد');
+            openAdminLogin();
+        }
+
+        // ============ عرض المنتجات مع التحميل المجزأ ============
+        const mediaStore = {};
+
+        function renderProductCard(p) {
+            let mediaHtml = '';
+            const mediaItems = p.media || (p.image_url ? [{url: p.image_url, type: 'image'}] : []);
+            mediaStore[p.id] = mediaItems;
+
+            if (mediaItems.length > 0) {
+                mediaHtml = `
+                <div class="flex gap-2 overflow-x-auto p-2 bg-gray-50 border-b">
+                    ${mediaItems.map((m, idx) => m.type === 'video'
+                        ? `<video src="${m.url}" preload="none" loading="lazy" onclick="openLightbox(${p.id}, ${idx})" class="h-44 w-64 object-cover rounded-lg shrink-0 cursor-pointer"></video>`
+                        : `<img src="${m.url}" loading="lazy" onclick="openLightbox(${p.id}, ${idx})" class="h-44 w-64 object-cover rounded-lg shrink-0 cursor-pointer">`
+                    ).join('')}
+                </div>`;
+            }
+
+            const adminControls = isAdmin ? `
+                <div class="flex gap-2 mt-2">
+                    <button onclick='openEditProduct(${JSON.stringify(p)})' class="flex-1 bg-blue-50 text-blue-700 border border-blue-200 text-xs py-1.5 rounded-lg font-bold">
+                        ✏️ تعديل
+                    </button>
+                    <button onclick="deleteProduct(${p.id}, '${(p.title || '').replace(/'/g, "\\'")}')" class="flex-1 bg-red-50 text-red-700 border border-red-200 text-xs py-1.5 rounded-lg font-bold">
+                        🗑️ حذف
+                    </button>
+                </div>` : '';
+
+            return `
+            <div class="bg-white rounded-xl shadow-sm border overflow-hidden flex flex-col justify-between">
+                ${mediaHtml}
+                <div class="p-4">
+                    <span class="bg-amber-100 text-amber-800 text-xs px-2 py-0.5 rounded font-bold">${p.category}</span>
+                    <h3 class="font-bold text-gray-900 mt-2 text-base">${p.title}</h3>
+                    <p class="text-emerald-700 font-bold mt-1 text-lg">$${p.price} <span class="text-xs text-gray-400 font-normal">/ للقطعة تقريباً</span></p>
+                    <p class="text-xs text-gray-500 mt-1">الحد الأدنى للطلب: <span class="font-bold text-gray-700">${p.moq} قطعة</span></p>
+                    <button onclick="openOrderModal(${p.id}, '${p.title}', ${p.moq})" class="mt-4 w-full bg-slate-900 hover:bg-slate-800 text-white text-sm py-2.5 rounded-lg font-bold">
+                        طلب تسعيرة شحن للبضاعة
+                    </button>
+                    ${adminControls}
+                </div>
+            </div>`;
+        }
+
+        // ============ معرض الصور والفيديوهات بالحجم الكامل (Lightbox) ============
+        let lightboxMedia = [];
+        let lightboxIndex = 0;
+        let lightboxZoom = 1;
+        let lightboxTouchStartX = 0;
+
+        function openLightbox(productId, index) {
+            lightboxMedia = mediaStore[productId] || [];
+            if (!lightboxMedia.length) return;
+            lightboxIndex = index;
+            renderLightboxItem();
+            document.getElementById('lightboxModal').classList.remove('hidden');
+        }
+
+        function closeLightbox() {
+            const video = document.querySelector('#lightboxContent video');
+            if (video) video.pause();
+            document.getElementById('lightboxModal').classList.add('hidden');
+        }
+
+        function renderLightboxItem() {
+            const item = lightboxMedia[lightboxIndex];
+            const content = document.getElementById('lightboxContent');
+            lightboxZoom = 1;
+
+            if (item.type === 'video') {
+                content.innerHTML = `<video src="${item.url}" controls autoplay class="max-h-full max-w-full"></video>`;
+            } else {
+                content.innerHTML = `<img id="lightboxImg" src="${item.url}" ondblclick="lightboxToggleZoom()" class="max-h-[85vh] max-w-full object-contain transition-transform duration-150" style="transform: scale(1)">`;
+            }
+
+            document.getElementById('lightboxCounter').innerText = `${lightboxIndex + 1} / ${lightboxMedia.length}`;
+            const showNav = lightboxMedia.length > 1;
+            document.getElementById('lightboxPrev').style.display = showNav ? 'flex' : 'none';
+            document.getElementById('lightboxNext').style.display = showNav ? 'flex' : 'none';
+        }
+
+        function lightboxPrev() {
+            lightboxIndex = (lightboxIndex - 1 + lightboxMedia.length) % lightboxMedia.length;
+            renderLightboxItem();
+        }
+        function lightboxNext() {
+            lightboxIndex = (lightboxIndex + 1) % lightboxMedia.length;
+            renderLightboxItem();
+        }
+
+        function applyLightboxZoom() {
+            const img = document.getElementById('lightboxImg');
+            if (img) img.style.transform = `scale(${lightboxZoom})`;
+        }
+        function lightboxZoomIn() {
+            lightboxZoom = Math.min(lightboxZoom + 0.5, 3);
+            applyLightboxZoom();
+        }
+        function lightboxZoomOut() {
+            lightboxZoom = Math.max(lightboxZoom - 0.5, 1);
+            applyLightboxZoom();
+        }
+        function lightboxToggleZoom() {
+            lightboxZoom = lightboxZoom > 1 ? 1 : 2;
+            applyLightboxZoom();
+        }
+
+        // تمرير باللمس للتنقل بين الصور (يتعطل أثناء التكبير حتى يتيح التمرير الطبيعي للاستكشاف)
+        function lightboxTouchStart(e) {
+            lightboxTouchStartX = e.touches[0].clientX;
+        }
+        function lightboxTouchEnd(e) {
+            if (lightboxZoom > 1) return;
+            const diff = e.changedTouches[0].clientX - lightboxTouchStartX;
+            if (Math.abs(diff) > 50) {
+                if (diff > 0) lightboxPrev(); else lightboxNext();
+            }
+        }
+
+        // التنقل بلوحة المفاتيح على الحاسوب
+        document.addEventListener('keydown', function (e) {
+            if (document.getElementById('lightboxModal').classList.contains('hidden')) return;
+            if (e.key === 'Escape') closeLightbox();
+            else if (e.key === 'ArrowLeft') lightboxPrev();
+            else if (e.key === 'ArrowRight') lightboxNext();
+        });
+
+        async function fetchProducts() {
+            currentOffset = 0;
+            reachedEnd = false;
+            const container = document.getElementById('products-grid');
+            container.innerHTML = '<div class="col-span-full text-center py-10 text-gray-500">جاري تحميل البضائع...</div>';
+            document.getElementById('noMoreText').classList.add('hidden');
+
+            isLoadingProducts = true;
+            const res = await fetch(`/api/products?limit=${PAGE_SIZE}&offset=0`);
+            const prods = await res.json();
+            isLoadingProducts = false;
+
+            if (!prods.length) {
+                container.innerHTML = '<p class="text-center col-span-full py-8 text-gray-500">لا توجد بضائع منشورة بعد.</p>';
+                document.getElementById('loadMoreBtn').classList.add('hidden');
+                return;
+            }
+
+            container.innerHTML = prods.map(renderProductCard).join('');
+            currentOffset = prods.length;
+
+            if (prods.length < PAGE_SIZE) {
+                reachedEnd = true;
+                document.getElementById('loadMoreBtn').classList.add('hidden');
+                document.getElementById('noMoreText').classList.remove('hidden');
+            } else {
+                document.getElementById('loadMoreBtn').classList.remove('hidden');
+            }
+        }
+
+        async function loadMoreProducts() {
+            if (isLoadingProducts || reachedEnd) return;
+            isLoadingProducts = true;
+            const btn = document.getElementById('loadMoreBtn');
+            const originalText = btn.innerText;
+            btn.innerText = 'جاري التحميل...';
+            btn.disabled = true;
+
+            const res = await fetch(`/api/products?limit=${PAGE_SIZE}&offset=${currentOffset}`);
+            const prods = await res.json();
+
+            const container = document.getElementById('products-grid');
+            container.insertAdjacentHTML('beforeend', prods.map(renderProductCard).join(''));
+            currentOffset += prods.length;
+
+            if (prods.length < PAGE_SIZE) {
+                reachedEnd = true;
+                btn.classList.add('hidden');
+                document.getElementById('noMoreText').classList.remove('hidden');
+            } else {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+            isLoadingProducts = false;
+        }
+
+        // تمرير لا نهائي: يراقب عنصراً بأسفل الصفحة ويحمّل المزيد تلقائياً
+        const scrollObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting && !isLoadingProducts && !reachedEnd) {
+                    loadMoreProducts();
+                }
+            });
+        }, { rootMargin: '200px' });
+        scrollObserver.observe(document.getElementById('scrollSentinel'));
+
+        // ============ رفع بضاعة جديدة مع شريط تقدم حقيقي ============
+        function handleUpload(e) {
+            e.preventDefault();
+            const btn = document.getElementById('uploadBtn');
+            const progressWrap = document.getElementById('uploadProgressWrap');
+            const progressBar = document.getElementById('uploadProgressBar');
+            const progressPercent = document.getElementById('uploadProgressPercent');
+            const progressLabel = document.getElementById('uploadProgressLabel');
+
+            btn.innerText = 'جاري الرفع... يرجى الانتظار';
+            btn.disabled = true;
+            progressWrap.classList.remove('hidden');
+            progressBar.style.width = '0%';
+            progressPercent.innerText = '0%';
+            progressLabel.innerText = 'جاري رفع الملفات...';
+
+            const formData = new FormData();
+            formData.append('title', document.getElementById('pTitle').value);
+            formData.append('category', document.getElementById('pCat').value);
+            formData.append('price', document.getElementById('pPrice').value);
+            formData.append('moq', document.getElementById('pMoq').value);
+
+            const fileInput = document.getElementById('pFiles');
+            for (let i = 0; i < fileInput.files.length; i++) {
+                formData.append('files', fileInput.files[i]);
+            }
+
+            // منع إغلاق الصفحة بالخطأ أثناء الرفع
+            const beforeUnloadHandler = function (ev) {
+                ev.preventDefault();
+                ev.returnValue = '';
+            };
+            window.addEventListener('beforeunload', beforeUnloadHandler);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/products/upload', true);
+            xhr.setRequestHeader('X-Admin-Key', getAdminKey());
+
+            xhr.upload.onprogress = function (event) {
+                if (event.lengthComputable) {
+                    const percent = Math.round((event.loaded / event.total) * 100);
+                    progressBar.style.width = percent + '%';
+                    progressPercent.innerText = percent + '%';
+                    progressLabel.innerText = percent < 100 ? 'جاري رفع الملفات...' : 'جاري الحفظ في قاعدة البيانات...';
+                }
+            };
+
+            xhr.onload = function () {
+                window.removeEventListener('beforeunload', beforeUnloadHandler);
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    alert('تم نشر البضاعة بالصور والفيديوهات بنجاح!');
+                    closeAdminUpload();
+                    fetchProducts();
+                } else if (xhr.status === 401) {
+                    handleAuthFailure();
+                } else {
+                    alert('حدث خطأ أثناء الرفع، تأكد من إنشاء مجلد media في Supabase');
+                }
+                resetUploadForm();
+            };
+
+            xhr.onerror = function () {
+                window.removeEventListener('beforeunload', beforeUnloadHandler);
+                alert('تعذر الاتصال بالخادم أثناء الرفع، تحقق من اتصال الإنترنت');
+                resetUploadForm();
+            };
+
+            function resetUploadForm() {
+                btn.innerText = 'رفع وحفظ الآن';
+                btn.disabled = false;
+                progressWrap.classList.add('hidden');
+            }
+
+            xhr.send(formData);
+        }
+
+        // ============ تعديل وحذف البضاعة (للمدير فقط) ============
+        function openEditProduct(p) {
+            document.getElementById('editProductId').value = p.id;
+            document.getElementById('ePTitle').value = p.title;
+            document.getElementById('ePCat').value = p.category;
+            document.getElementById('ePPrice').value = p.price;
+            document.getElementById('ePMoq').value = p.moq;
+            document.getElementById('editProductError').classList.add('hidden');
+            document.getElementById('editProductModal').classList.remove('hidden');
+        }
+        function closeEditProduct() {
+            document.getElementById('editProductModal').classList.add('hidden');
+        }
+
+        async function handleEditProduct(e) {
+            e.preventDefault();
+            const btn = document.getElementById('editProductBtn');
+            const errEl = document.getElementById('editProductError');
+            errEl.classList.add('hidden');
+            const id = document.getElementById('editProductId').value;
+            const body = {
+                title: document.getElementById('ePTitle').value,
+                category: document.getElementById('ePCat').value,
+                price: parseFloat(document.getElementById('ePPrice').value),
+                moq: parseInt(document.getElementById('ePMoq').value)
+            };
+            btn.disabled = true;
+            btn.innerText = 'جاري الحفظ...';
+            try {
+                const res = await fetch(`/api/products/${id}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Admin-Key': getAdminKey()
+                    },
+                    body: JSON.stringify(body)
+                });
+                if (res.ok) {
+                    closeEditProduct();
+                    fetchProducts();
+                } else if (res.status === 401) {
+                    closeEditProduct();
+                    handleAuthFailure();
+                } else {
+                    errEl.innerText = 'تعذر حفظ التعديلات';
+                    errEl.classList.remove('hidden');
+                }
+            } catch (e2) {
+                errEl.innerText = 'تعذر الاتصال بالخادم';
+                errEl.classList.remove('hidden');
+            }
+            btn.disabled = false;
+            btn.innerText = 'حفظ التعديلات';
+        }
+
+        async function deleteProduct(id, title) {
+            if (!confirm(`هل أنت متأكد من حذف "${title}" نهائياً؟ لا يمكن التراجع عن هذا الإجراء.`)) return;
+            const res = await fetch(`/api/products/${id}`, {
+                method: 'DELETE',
+                headers: {'X-Admin-Key': getAdminKey()}
+            });
+            if (res.ok) {
+                fetchProducts();
+            } else if (res.status === 401) {
+                handleAuthFailure();
+            } else {
+                alert('تعذر حذف البضاعة');
+            }
+        }
+
+        // ============ لائحة الطلبات (محمية) ============
+        function formatOrderDate(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            const datePart = d.toLocaleDateString('ar-EG', {year: 'numeric', month: 'short', day: 'numeric'});
+            const timePart = d.toLocaleTimeString('ar-EG', {hour: '2-digit', minute: '2-digit'});
+            return `${datePart} - ${timePart}`;
+        }
+
+        function renderOrderCard(o) {
+            let statusAction = '';
+            if (o.status === 'completed') {
+                statusAction = `<span class="text-emerald-700 text-[11px] font-bold">✅ اكتمل بتاريخ: ${formatOrderDate(o.completed_at)}</span>`;
+            } else if (o.status === 'processing') {
+                statusAction = `<button onclick="updateOrderStatus(${o.id}, 'completed')" class="text-emerald-700 text-[11px] font-bold">✅ إكمال الطلب</button>`;
+            } else {
+                statusAction = `<button onclick="updateOrderStatus(${o.id}, 'processing')" class="text-amber-700 text-[11px] font-bold">▶️ بدء المعالجة</button>`;
+            }
+
+            return `
+                <div class="border rounded-xl p-3 bg-gray-50 text-xs space-y-1">
+                    <div class="flex justify-between font-bold text-gray-800 text-sm">
+                        <span>${o.customer_name}</span>
+                        <span class="text-emerald-700">${o.quantity} قطعة</span>
+                    </div>
+                    <div class="text-gray-600">البضاعة: <span class="font-bold text-blue-600">${o.products?.title || 'منتج'}</span></div>
+                    <div class="text-gray-600">الهاتف: <a href="tel:${o.customer_phone}" class="underline text-blue-700">${o.customer_phone}</a></div>
+                    <div class="text-gray-600">وجهة الشحن: <strong>${o.destination_country}</strong></div>
+                    <div class="flex justify-between items-center pt-1">
+                        ${statusAction}
+                        <button onclick="deleteOrder(${o.id})" class="text-red-600 text-[11px] font-bold">🗑️ حذف</button>
+                    </div>
+                </div>`;
+        }
+
+        function renderOrdersSection(title, orders, emptyText) {
+            return `
+                <div>
+                    <h4 class="text-xs font-bold text-gray-500 mb-2">${title} (${orders.length})</h4>
+                    <div class="space-y-2">
+                        ${orders.length ? orders.map(renderOrderCard).join('') : `<p class="text-center text-gray-400 text-[11px] py-3">${emptyText}</p>`}
+                    </div>
+                </div>`;
+        }
+
+        async function openOrdersList() {
+            document.getElementById('ordersModal').classList.remove('hidden');
+            const list = document.getElementById('ordersListContent');
+            list.innerHTML = 'جاري جلب الطلبات...';
+            const res = await fetch('/api/orders', {
+                headers: {'X-Admin-Key': getAdminKey()}
+            });
+            if (res.status === 401) {
+                closeOrdersList();
+                handleAuthFailure();
+                return;
+            }
+            const orders = await res.json();
+            if (!orders.length) {
+                list.innerHTML = '<p class="text-center py-6 text-gray-500 text-sm">لا توجد طلبات مستلمة بعد.</p>';
+                return;
+            }
+
+            const pending = orders.filter(o => !o.status || o.status === 'pending');
+            const processing = orders.filter(o => o.status === 'processing');
+            const completed = orders.filter(o => o.status === 'completed');
+
+            list.innerHTML = `
+                <div class="space-y-5">
+                    ${renderOrdersSection('🆕 طلبات جديدة', pending, 'لا توجد طلبات جديدة')}
+                    ${renderOrdersSection('⏳ قيد المعالجة حالياً', processing, 'لا توجد طلبات قيد المعالجة')}
+                    ${renderOrdersSection('✅ طلبات مكتملة', completed, 'لا توجد طلبات مكتملة بعد')}
+                </div>`;
+        }
+
+        async function updateOrderStatus(id, status) {
+            const res = await fetch(`/api/orders/${id}/status`, {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Admin-Key': getAdminKey()
+                },
+                body: JSON.stringify({status})
+            });
+            if (res.ok) {
+                openOrdersList();
+            } else if (res.status === 401) {
+                closeOrdersList();
+                handleAuthFailure();
+            } else {
+                alert('تعذر تحديث حالة الطلب');
+            }
+        }
+
+        async function deleteOrder(id) {
+            if (!confirm('هل تم التعامل مع هذا الطلب وتريد حذفه من القائمة؟')) return;
+            const res = await fetch(`/api/orders/${id}`, {
+                method: 'DELETE',
+                headers: {'X-Admin-Key': getAdminKey()}
+            });
+            if (res.ok) {
+                openOrdersList();
+            } else if (res.status === 401) {
+                closeOrdersList();
+                handleAuthFailure();
+            } else {
+                alert('تعذر حذف الطلب');
+            }
+        }
+
+        function closeOrdersList() { document.getElementById('ordersModal').classList.add('hidden'); }
+        function openAdminUpload() { document.getElementById('adminUploadModal').classList.remove('hidden'); }
+        function closeAdminUpload() { document.getElementById('adminUploadModal').classList.add('hidden'); }
+        function openOrderModal(id, title, moq) {
+            document.getElementById('orderProductId').value = id;
+            document.getElementById('modalProductTitle').innerText = title;
+            document.getElementById('custQty').value = moq;
+            document.getElementById('orderModal').classList.remove('hidden');
+        }
+        function closeOrderModal() { document.getElementById('orderModal').classList.add('hidden'); }
+
+        async function submitOrder(e) {
+            e.preventDefault();
+            const body = {
+                product_id: parseInt(document.getElementById('orderProductId').value),
+                customer_name: document.getElementById('custName').value,
+                customer_phone: document.getElementById('custPhone').value,
+                destination_country: document.getElementById('custDest').value,
+                quantity: parseInt(document.getElementById('custQty').value)
+            };
+            const res = await fetch('/api/orders', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+            if (res.ok) {
+                alert('تم إرسال طلب التسعيرة بنجاح! سيتم التواصل معكم من مكتب الصين.');
+                closeOrderModal();
+            }
+        }
+
+        // ============ بدء التشغيل ============
+        renderAdminHeader();
+        (async function init() {
+            await verifyAdminSession();
+            fetchProducts();
+        })();
+    </script>
+</body>
+</html>
+    """
 
 
 @app.post("/api/products/upload")
